@@ -428,7 +428,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 **Jeremy Gracey**
 - GitHub: [@JeremyGracey-AI](https://github.com/JeremyGracey-AI)
-- LinkedIn: [linkedin.com/in/jeremygracey-ai](www.linkedin.com/in/jeremygracey-ai)
+- LinkedIn: [linkedin.com/in/jeremygracey-ai](https://linkedin.com/in/jeremygracey-ai)
 
 ---
 
