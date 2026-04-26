@@ -8,28 +8,64 @@ Author: Jeremy Gracey
 License: MIT
 """
 
-import os
-import json
-import logging
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
-from pathlib import Path
+from __future__ import annotations
 
-# Third-party imports
-import fitz  # PyMuPDF for PDF extraction
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-from langchain.llms.base import LLM
-from langchain.callbacks.manager import CallbackManagerLLMRun, AsyncCallbackManagerLLMRun
-import numpy as np
+import os
+import logging
+from importlib import import_module
+from typing import Any, List, Dict, Optional
+from dataclasses import dataclass
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised only in minimal environments
+    np = None
+
+try:
+    from langchain.llms.base import LLM
+    from langchain.callbacks.manager import CallbackManagerLLMRun, AsyncCallbackManagerLLMRun
+    from langchain.prompts import PromptTemplate
+except ImportError:  # Allows importing and testing non-LLM code without LangChain.
+    class LLM:
+        """Small fallback matching the LangChain call interface used here."""
+
+        def __call__(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            return self._call(prompt, *args, **kwargs)
+
+    class PromptTemplate:
+        """Minimal prompt formatter used when LangChain is not installed."""
+
+        def __init__(self, input_variables: List[str], template: str):
+            self.input_variables = input_variables
+            self.template = template
+
+        def format(self, **kwargs: Any) -> str:
+            return self.template.format(**kwargs)
+
+    CallbackManagerLLMRun = Any
+    AsyncCallbackManagerLLMRun = Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def require_dependency(module_name: str, package_name: Optional[str] = None, purpose: Optional[str] = None):
+    """
+    Import an optional runtime dependency with an actionable installation message.
+
+    Heavy ML dependencies are imported lazily so the module remains importable for
+    tests, documentation examples, and environments that have not downloaded models.
+    """
+    try:
+        return import_module(module_name)
+    except ImportError as exc:
+        install_name = package_name or module_name.split(".")[0]
+        detail = f" for {purpose}" if purpose else ""
+        raise ImportError(
+            f"{install_name} is required{detail}. "
+            "Install project dependencies with: python3 -m pip install -r requirements.txt"
+        ) from exc
 
 
 # ==============================================================================
@@ -98,6 +134,7 @@ class PDFIngestor:
         if not os.path.exists(self.pdf_path):
             raise FileNotFoundError(f"PDF not found at {self.pdf_path}")
 
+        fitz = require_dependency("fitz", "PyMuPDF", "PDF ingestion")
         logger.info(f"Extracting text from {self.pdf_path}")
 
         full_text = []
@@ -125,6 +162,10 @@ class PDFIngestor:
         Returns:
             List of dicts containing text and page metadata.
         """
+        if not os.path.exists(self.pdf_path):
+            raise FileNotFoundError(f"PDF not found at {self.pdf_path}")
+
+        fitz = require_dependency("fitz", "PyMuPDF", "PDF ingestion")
         logger.info(f"Extracting text with metadata from {self.pdf_path}")
 
         documents = []
@@ -157,9 +198,14 @@ class TextChunker:
             chunk_size: Maximum size of each chunk in characters.
             chunk_overlap: Number of overlapping characters between chunks.
         """
+        text_splitter_module = require_dependency(
+            "langchain.text_splitter",
+            "langchain",
+            "text chunking",
+        )
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.splitter = RecursiveCharacterTextSplitter(
+        self.splitter = text_splitter_module.RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", ". ", " ", ""]
@@ -220,7 +266,12 @@ class EmbeddingGenerator:
             model_name: Name of the Sentence-Transformers model to use.
         """
         logger.info(f"Loading embedding model: {model_name}")
-        self.model = SentenceTransformer(model_name)
+        sentence_transformers = require_dependency(
+            "sentence_transformers",
+            "sentence-transformers",
+            "embedding generation",
+        )
+        self.model = sentence_transformers.SentenceTransformer(model_name)
         self.model_name = model_name
 
     def embed_text(self, text: str) -> np.ndarray:
@@ -271,8 +322,11 @@ class VectorStore:
         self.db_path = db_path
         self.collection_name = collection_name
 
+        chromadb = require_dependency("chromadb", "chromadb", "vector storage")
+        chroma_config = require_dependency("chromadb.config", "chromadb", "vector storage")
+
         # Create ChromaDB client with persistent storage
-        settings = Settings(
+        settings = chroma_config.Settings(
             chroma_db_impl="duckdb+parquet",
             persist_directory=db_path,
             anonymized_telemetry=False
@@ -385,15 +439,15 @@ class MistralLLM(LLM):
         """
         super().__init__()
 
-        try:
-            from llama_cpp import Llama
-        except ImportError:
-            raise ImportError("llama-cpp-python is required. Install with: pip install llama-cpp-python")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found at {model_path}")
+
+        llama_cpp = require_dependency("llama_cpp", "llama-cpp-python", "LLM inference")
 
         logger.info(f"Loading Mistral model from {model_path}")
 
         self.model_path = model_path
-        self.llm = Llama(
+        self.llm = llama_cpp.Llama(
             model_path=model_path,
             n_gpu_layers=kwargs.get("n_gpu_layers", 35),
             n_ctx=kwargs.get("n_ctx", 2048),
@@ -876,65 +930,75 @@ def main():
     # Initialize components
     logger.info("Initializing RAG pipeline...")
 
+    missing_assets = []
+    if not os.path.exists(config.pdf_path):
+        missing_assets.append(f"PDF data file: {config.pdf_path}")
+    if not os.path.exists(config.mistral_model_path):
+        missing_assets.append(f"Mistral model file: {config.mistral_model_path}")
+
+    if missing_assets:
+        logger.warning("Full RAG pipeline cannot start because required assets are missing:")
+        for asset in missing_assets:
+            logger.warning("  - %s", asset)
+        logger.info("Install dependencies with: python3 -m pip install -r requirements.txt")
+        logger.info("Then add the Merck Manual PDF and Mistral GGUF model described in README.md")
+        return {"status": "missing_assets", "missing_assets": missing_assets}
+
     # 1. PDF Ingestion
     ingestor = PDFIngestor(config.pdf_path)
-    # text = ingestor.extract_text()  # Uncomment when PDF is available
+    documents = ingestor.extract_text_with_metadata()
 
     # 2. Text Chunking
     chunker = TextChunker(config.chunk_size, config.chunk_overlap)
-    # chunks = chunker.chunk_text(text)  # Uncomment when text is available
+    chunked_documents = chunker.chunk_documents(documents)
 
     # 3. Embedding Generation
     embedding_gen = EmbeddingGenerator(config.embedding_model_name)
+    embeddings = embedding_gen.embed_texts([doc["text"] for doc in chunked_documents])
 
     # 4. Vector Store
     vector_store = VectorStore(config.chroma_db_path, config.collection_name)
+    vector_store.index_documents(chunked_documents, embeddings)
+    vector_store.persist()
 
-    # 5. LLM Setup (requires model file)
-    try:
-        llm = MistralLLM(
-            config.mistral_model_path,
-            n_gpu_layers=config.n_gpu_layers,
-            n_ctx=config.n_ctx,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            max_tokens=config.max_tokens
-        )
-    except FileNotFoundError:
-        logger.warning(f"Model not found at {config.mistral_model_path}")
-        logger.info("To use the full RAG pipeline, download Mistral-7B-Instruct GGUF model")
-        llm = None
+    # 5. LLM Setup
+    llm = MistralLLM(
+        config.mistral_model_path,
+        n_gpu_layers=config.n_gpu_layers,
+        n_ctx=config.n_ctx,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        max_tokens=config.max_tokens
+    )
 
     # 6. RAG Chain
-    if llm:
-        rag_chain = RAGChain(vector_store, llm, embedding_gen, config.retriever_k)
+    rag_chain = RAGChain(vector_store, llm, embedding_gen, config.retriever_k)
 
-        # 8. Medical Assistant
-        assistant = MedicalAssistant(rag_chain)
+    # 8. Medical Assistant
+    assistant = MedicalAssistant(rag_chain)
 
-        # Example queries
-        sample_queries = [
-            "What are the symptoms of hypertension?",
-            "How is diabetes diagnosed?",
-            "What is the treatment for pneumonia?",
-            "Describe the pathophysiology of heart failure",
-            "What are the risk factors for stroke?"
-        ]
+    # Example queries
+    sample_queries = [
+        "What are the symptoms of hypertension?",
+        "How is diabetes diagnosed?",
+        "What is the treatment for pneumonia?",
+        "Describe the pathophysiology of heart failure",
+        "What are the risk factors for stroke?"
+    ]
 
-        logger.info("Running sample queries...")
-        for query in sample_queries:
-            print(f"\nQuery: {query}")
+    logger.info("Running sample queries...")
+    for query in sample_queries:
+        print(f"\nQuery: {query}")
 
-            try:
-                result = assistant.query(query, strategy="rag_augmented")
-                print(f"Answer: {result['answer']}")
-                print(f"Sources: {result['num_sources']}")
-            except Exception as e:
-                logger.error(f"Error processing query: {str(e)}")
-                print(f"Error: {str(e)}")
-    else:
-        logger.info("Skipping query execution - LLM model not available")
-        logger.info("The RAG pipeline is set up and ready to use once the model is downloaded")
+        try:
+            result = assistant.query(query, strategy="rag_augmented")
+            print(f"Answer: {result['answer']}")
+            print(f"Sources: {result['num_sources']}")
+        except Exception as e:
+            logger.error(f"Error processing query: {str(e)}")
+            print(f"Error: {str(e)}")
+
+    return {"status": "completed", "queries_run": len(sample_queries)}
 
 
 if __name__ == "__main__":
