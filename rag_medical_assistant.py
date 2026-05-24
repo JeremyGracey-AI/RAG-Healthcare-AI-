@@ -330,8 +330,11 @@ class VectorStore:
             chroma_db_impl="duckdb+parquet",
             persist_directory=db_path,
             anonymized_telemetry=False
+        # Create ChromaDB client with persistent storage.
+        self.client = chromadb.PersistentClient(
+            path=db_path,
+            settings=chromadb.Settings(anonymized_telemetry=False),
         )
-        self.client = chromadb.Client(settings)
         self.collection = None
 
         logger.info(f"Initialized ChromaDB at {db_path}")
@@ -344,13 +347,13 @@ class VectorStore:
             embedding_function: Optional custom embedding function.
         """
         if embedding_function:
-            self.collection = self.client.create_collection(
+            self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
                 embedding_function=embedding_function,
                 metadata={"hnsw:space": "cosine"}
             )
         else:
-            self.collection = self.client.create_collection(
+            self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
                 metadata={"hnsw:space": "cosine"}
             )
@@ -418,7 +421,7 @@ class VectorStore:
 
     def persist(self):
         """Persist the vector store to disk."""
-        self.client.persist()
+        # PersistentClient writes changes automatically.
         logger.info(f"Persisted vector store to {self.db_path}")
 
 
@@ -428,6 +431,12 @@ class VectorStore:
 
 class MistralLLM(LLM):
     """Custom LangChain wrapper for Mistral-7B via llama-cpp-python."""
+
+    model_path: str
+    temperature: float = 0.3
+    top_p: float = 0.95
+    max_tokens: int = 512
+    _llm: Any = PrivateAttr()
 
     def __init__(self, model_path: str, **kwargs):
         """
@@ -448,15 +457,25 @@ class MistralLLM(LLM):
 
         self.model_path = model_path
         self.llm = llama_cpp.Llama(
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise ImportError("llama-cpp-python is required. Install with: pip install llama-cpp-python")
+
+        logger.info(f"Loading Mistral model from {model_path}")
+
+        super().__init__(
+            model_path=model_path,
+            temperature=kwargs.get("temperature", 0.3),
+            top_p=kwargs.get("top_p", 0.95),
+            max_tokens=kwargs.get("max_tokens", 512),
+        )
+        self._llm = Llama(
             model_path=model_path,
             n_gpu_layers=kwargs.get("n_gpu_layers", 35),
             n_ctx=kwargs.get("n_ctx", 2048),
             verbose=False
         )
-
-        self.temperature = kwargs.get("temperature", 0.3)
-        self.top_p = kwargs.get("top_p", 0.95)
-        self.max_tokens = kwargs.get("max_tokens", 512)
 
     @property
     def _llm_type(self) -> str:
@@ -467,7 +486,7 @@ class MistralLLM(LLM):
         self,
         prompt: str,
         stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerLLMRun] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs
     ) -> str:
         """
@@ -482,7 +501,7 @@ class MistralLLM(LLM):
         Returns:
             Generated text.
         """
-        output = self.llm(
+        output = self._llm(
             prompt,
             temperature=self.temperature,
             top_p=self.top_p,
@@ -496,7 +515,7 @@ class MistralLLM(LLM):
         self,
         prompt: str,
         stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerLLMRun] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs
     ) -> str:
         """Async call (not implemented for llama-cpp-python)."""
@@ -723,7 +742,7 @@ class MedicalAssistant:
 
         # Generate response
         prompt_text = prompt.format(**input_vars)
-        answer = self.rag_chain.llm(prompt_text)
+        answer = generate_llm_text(self.rag_chain.llm, prompt_text)
 
         result = {
             "question": question,
@@ -872,7 +891,7 @@ class ExperimentRunner:
 
         # Baseline response (no context)
         baseline_prompt = f"Answer this medical question: {query}\n\nAnswer:"
-        baseline_response = self.baseline_llm(baseline_prompt)
+        baseline_response = generate_llm_text(self.baseline_llm, baseline_prompt)
 
         # RAG response
         rag_response = self.assistant.query(query, strategy="rag_augmented")
@@ -970,6 +989,22 @@ def main():
         top_p=config.top_p,
         max_tokens=config.max_tokens
     )
+
+    # 5. LLM Setup (requires model file)
+    try:
+        llm = MistralLLM(
+            config.mistral_model_path,
+            n_gpu_layers=config.n_gpu_layers,
+            n_ctx=config.n_ctx,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            max_tokens=config.max_tokens
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(f"Model not found at {config.mistral_model_path}")
+        logger.debug("Model load failed: %s", exc)
+        logger.info("To use the full RAG pipeline, download Mistral-7B-Instruct GGUF model")
+        llm = None
 
     # 6. RAG Chain
     rag_chain = RAGChain(vector_store, llm, embedding_gen, config.retriever_k)
